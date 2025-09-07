@@ -150,33 +150,6 @@ jobs:
           minor=$(echo "$version" | cut -d. -f1-2)
           base="ghcr.io/${OWNER}/${IMAGE_NAME}"
           tags=("$base:$version" "$base:$minor" "$base:$major" "$base:latest")
-
-          # Extract labels from first loaded arch image for manifest annotations
-          first_img=$(head -1 image-list.txt || true)
-          title=$(docker image inspect "$first_img" -f '{{ index .Config.Labels "org.opencontainers.image.title"}}' 2>/dev/null || true)
-          desc=$(docker image inspect "$first_img" -f '{{ index .Config.Labels "org.opencontainers.image.description"}}' 2>/dev/null || true)
-          source=$(docker image inspect "$first_img" -f '{{ index .Config.Labels "org.opencontainers.image.source"}}' 2>/dev/null || true)
-          licenses=$(docker image inspect "$first_img" -f '{{ index .Config.Labels "org.opencontainers.image.licenses"}}' 2>/dev/null || true)
-          if [ -z "$desc" ]; then
-            # Fallback: extract from Dockerfile label or use static default
-            desc=$(grep -E 'org.opencontainers.image.description=' -m1 Dockerfile | sed -E 's/.*org.opencontainers.image.description="([^"]*)".*/\1/' || true)
-          fi
-          if [ -z "$desc" ]; then
-            desc="Minimal GitHub CLI image providing /opt/bin/gh"
-            echo '::warning title=Description Fallback Used::Using default description for multi-arch manifest.'
-          fi
-          ann_args=()
-          add_ann() { [ -n "$2" ] && ann_args+=( --annotation "$1=$2" ); }
-          add_ann org.opencontainers.image.title "$title"
-          add_ann org.opencontainers.image.description "$desc"
-          add_ann org.opencontainers.image.source "$source"
-          add_ann org.opencontainers.image.version "$version"
-          add_ann org.opencontainers.image.licenses "$licenses"
-          if [ ${#ann_args[@]} -eq 0 ]; then
-            echo '::warning title=No OCI Annotations Added::No label values discovered for manifest annotations.'
-          else
-            printf 'Adding manifest annotations:\n'; printf ' - %s\n' "${ann_args[@]}" | sed 's/--annotation //'
-          fi
           echo 'Assembling manifest from:'
           cat image-list.txt
           create_args=()
@@ -184,7 +157,7 @@ jobs:
             create_args+=( -t "$t" )
           done
           mapfile -t imgs < image-list.txt
-          docker buildx imagetools create "${create_args[@]}" "${ann_args[@]}" "${imgs[@]}"
+          docker buildx imagetools create "${create_args[@]}" "${imgs[@]}"
           printf 'Published tags:\n'; printf ' - %s\n' "${tags[@]}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
