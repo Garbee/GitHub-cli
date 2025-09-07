@@ -74,6 +74,18 @@ jobs:
                     present_access_fail+=("$aname:$code")
                     ;;
                 esac
+                # Direct API GET check (closest to actions/download-artifact behavior)
+                # Endpoint: GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip
+                api_download_code=$(curl -s -o /dev/null -w '%{http_code}' \
+                  -H "Authorization: Bearer $TOKEN" \
+                  -H 'Accept: application/vnd.github+json' \
+                  "https://api.github.com/repos/$GH_REPO/actions/artifacts/$aid/zip" || echo 000)
+                if [ "$api_download_code" -ne 200 ]; then
+                  # Replace or append a failure marker reflecting API code (preferred signal)
+                  present_access_fail+=("$aname:api-$api_download_code")
+                else
+                  present_access_ok+=("$aname:api-200")
+                fi
               fi
             done <<< "$names"
           fi
