@@ -7,7 +7,7 @@ on:
 
 permissions:
   contents: read
-  # actions: read       # needed to download artifacts from another run
+  actions: read       # needed to download artifacts from another run
   packages: write
   id-token: write
   attestations: write
@@ -47,8 +47,9 @@ jobs:
           # Expected artifacts (keep in sync with build matrix)
           required=(build-amd64 build-arm64)
           missing=()
+          names=$(jq -r '.artifacts[]?.name' artifacts.json || true)
           for r in "${required[@]}"; do
-            if ! jq -e --arg n "$r" '.artifacts[]?.name == $n' artifacts.json >/dev/null 2>&1; then
+            if ! grep -Fxq "$r" <<< "$names"; then
               missing+=("$r")
             fi
           done
