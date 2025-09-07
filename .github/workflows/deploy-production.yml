@@ -1,0 +1,182 @@
+name: Publish to Docker Hub
+
+on:
+  workflow_run:
+    workflows: ["Publish To Github Container Registry"]
+    types: [completed]
+    branches: [ main ]
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+env:
+  IMAGE_NAME: github-cli
+  OWNER: garbee
+  DOCKERHUB_NAMESPACE: garbee
+
+jobs:
+  promote:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    environment: Production
+    steps:
+      - name: Checkout (for reference only)
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Log in to GHCR (source)
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ env.OWNER }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to Docker Hub (target)
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Pull latest GHCR image (for label extraction)
+        id: meta
+        run: |
+          set -euo pipefail
+          src_base="ghcr.io/${OWNER}/${IMAGE_NAME}"
+          echo "Pulling $src_base:latest to extract labels" >&2
+          docker pull "$src_base:latest"
+          version=$(docker image inspect "$src_base:latest" -f '{{ index .Config.Labels "org.opencontainers.image.version"}}')
+          desc=$(docker image inspect "$src_base:latest" -f '{{ index .Config.Labels "org.opencontainers.image.description"}}')
+          if [ -z "$version" ]; then
+            echo '::error title=Missing Version Label::Could not read org.opencontainers.image.version from latest image.'
+            exit 1
+          fi
+            if [ -z "$desc" ]; then
+            echo '::warning title=Missing Description Label::No org.opencontainers.image.description found; manifest annotation will be omitted.'
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "desc=$desc" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $version"
+
+      - name: Compute tag variants
+        id: tags
+        run: |
+          set -euo pipefail
+          v='${{ steps.meta.outputs.version }}'
+          major=${v%%.*}
+          minor=$(echo "$v" | cut -d. -f1-2)
+          echo "major=$major" >> "$GITHUB_OUTPUT"
+          echo "minor=$minor" >> "$GITHUB_OUTPUT"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Copy multi-arch manifest to Docker Hub
+        id: promote
+        run: |
+          set -euo pipefail
+          src_version="ghcr.io/${OWNER}/${IMAGE_NAME}:${{ steps.tags.outputs.version }}"
+          # Ensure source version tag exists (pull will fail if missing)
+          echo "Validating source tag $src_version" >&2
+          docker buildx imagetools inspect "$src_version" >/dev/null 2>&1 || { echo "::error title=Source Tag Missing::Tag $src_version not found in GHCR"; exit 1; }
+
+          dst_ns='${{ env.DOCKERHUB_NAMESPACE }}'
+          dst_base="docker.io/${dst_ns}/${IMAGE_NAME}"
+          version='${{ steps.tags.outputs.version }}'
+          major='${{ steps.tags.outputs.major }}'
+          minor='${{ steps.tags.outputs.minor }}'
+          # Tag set mirrors GHCR
+          tags=( "$dst_base:$version" "$dst_base:$minor" "$dst_base:$major" "$dst_base:latest" )
+          echo 'Preparing imagetools create with tags:'
+          printf ' - %s\n' "${tags[@]}"
+          create_args=()
+          for t in "${tags[@]}"; do
+            create_args+=( -t "$t" )
+          done
+          desc='${{ steps.meta.outputs.desc }}'
+          if [ -n "$desc" ]; then
+            echo "Annotating manifest with description: $desc" >&2
+            docker buildx imagetools create "${create_args[@]}" --annotation "org.opencontainers.image.description=$desc" "$src_version"
+          else
+            docker buildx imagetools create "${create_args[@]}" "$src_version"
+          fi
+          printf '%s\n' "${tags[@]}" > dockerhub-tags.txt
+
+      - name: Show pushed Docker Hub manifest
+        run: |
+          set -euo pipefail
+          ref="docker.io/${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.version }}"
+          docker buildx imagetools inspect "$ref"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+
+      - name: Sign Docker Hub images (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          set -euo pipefail
+          base="docker.io/${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_NAME }}"
+          version='${{ steps.tags.outputs.version }}'
+          major='${{ steps.tags.outputs.major }}'
+          minor='${{ steps.tags.outputs.minor }}'
+          tags=("$base:$version" "$base:$minor" "$base:$major" "$base:latest")
+          echo 'Signing tags:'
+          for t in "${tags[@]}"; do
+            echo "  -> $t";
+            cosign sign --yes "$t";
+          done
+
+      - name: Extract digest for provenance (version tag)
+        id: digest
+        run: |
+          set -euo pipefail
+          ref="docker.io/${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_NAME }}:${{ steps.tags.outputs.version }}"
+          echo "Retrieving digest for $ref" >&2
+          attempt=0
+          digest=""
+          while [ $attempt -lt 5 ]; do
+            if output=$(docker buildx imagetools inspect "$ref" 2>&1); then
+              echo "$output" | sed -n '1,80p'
+              digest=$(echo "$output" | awk '/^Digest:/ {print $2; exit}')
+              [ -n "$digest" ] && break
+            fi
+            attempt=$((attempt+1))
+            echo "Retry $attempt..." >&2
+            sleep 3
+          done
+          if [ -z "$digest" ]; then
+            echo '::error title=Digest Extraction Failed::Unable to obtain digest for provenance attestation.'
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Digest: $digest"
+
+      - name: Generate and push build provenance (Docker Hub)
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-name: docker.io/${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify signature (latest tag, Docker Hub)
+        run: |
+          set -euo pipefail
+          ID_RE="https://github.com/${{ github.repository }}/.github/workflows/.*@.*"
+          ISSUER="https://token.actions.githubusercontent.com"
+          IMAGE="docker.io/${{ env.DOCKERHUB_NAMESPACE }}/${{ env.IMAGE_NAME }}:latest"
+          echo "Verifying $IMAGE with identity-regexp $ID_RE"
+          cosign verify \
+            --certificate-identity-regexp "$ID_RE" \
+            --certificate-oidc-issuer "$ISSUER" \
+            "$IMAGE" || { echo 'Verification failed'; exit 1; }
+
+      - name: Summary
+        run: |
+          {
+            echo "## 🚀 Production Deployment"
+            echo "Source: ghcr.io/${OWNER}/${IMAGE_NAME}:${{ steps.tags.outputs.version }}"
+            echo "Destination Namespace: ${DOCKERHUB_NAMESPACE}";
+            echo "Tags Pushed:";
+            sed 's/^/- /' dockerhub-tags.txt;
+          } >> "$GITHUB_STEP_SUMMARY"
