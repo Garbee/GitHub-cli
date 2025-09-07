@@ -79,16 +79,61 @@ jobs:
           tar="out-${{ steps.build.outputs.arch }}/gh-cli-${{ steps.build.outputs.arch }}.tar"
           docker load -i "$tar" >/dev/null
           img="gh-cli-temp:${{ steps.build.outputs.arch }}"
-          for key in org.opencontainers.image.title org.opencontainers.image.description org.opencontainers.image.source org.opencontainers.image.version org.opencontainers.image.licenses; do
-            val=$(docker image inspect "$img" -f "{{ index .Config.Labels \"$key\" }}") || true
-            if [ -z "$val" ]; then
-              echo "::error title=Missing OCI Label::$key not found on $img"
-              missing=1
+          required=( \
+            org.opencontainers.image.title \
+            org.opencontainers.image.description \
+            org.opencontainers.image.source \
+            org.opencontainers.image.version \
+            org.opencontainers.image.licenses )
+          missing=()
+          printf 'Discovered label values on %s:\n' "$img"
+          for key in "${required[@]}"; do
+            val=$(docker image inspect "$img" -f "{{ index .Config.Labels \"$key\" }}" 2>/dev/null || true)
+            if [ -n "$val" ]; then
+              printf '  - %s=%s\n' "$key" "$val"
             else
-              echo "$key=$val"
+              missing+=("$key")
             fi
           done
-          [ -n "${missing:-}" ] && { echo 'One or more required OCI labels missing.'; exit 1; }
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error title=Missing Required OCI Labels::${missing[*]} missing on $img"
+            {
+              echo '## ❌ Missing Required OCI Labels'
+              echo
+              echo "Image: \`$img\` (arch=$arch)"
+              echo
+              echo '| Label | Status |'
+              echo '|-------|--------|'
+              for key in "${required[@]}"; do
+                if printf '%s\n' "${missing[@]}" | grep -Fxq "$key"; then
+                  echo "| $key | ❌ Missing |"
+                else
+                  val=$(docker image inspect "$img" -f "{{ index .Config.Labels \"$key\" }}" 2>/dev/null || true)
+                  short="$val"
+                  [ ${#short} -gt 80 ] && short="${short:0:77}..."
+                  esc=${short//|/\|}
+                  echo "| $key | ✅ Present (${esc}) |"
+                fi
+              done
+              echo
+              echo '### How to Fix'
+              echo '1. Ensure each label is defined in the final image stage of the Dockerfile.'
+              echo '2. If labels are added only to an intermediate stage, re-declare with `LABEL` in the final stage.'
+              echo '3. Validate locally: `docker build -t test . && docker inspect test | jq .[0].Config.Labels`'
+              echo '4. Re-run the pipeline after adjusting the Dockerfile.'
+              echo
+              echo '**Required labels:**'
+              printf ' - %s\n' "${required[@]}"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          else
+            {
+              echo '## ✅ OCI Labels Verified'
+              echo
+              echo "All required labels present on image \`$img\` (arch=$arch)."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload build artifact (image + metadata)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
