@@ -1,0 +1,172 @@
+name: Publish To Github Container Registry
+
+on:
+  workflow_run:
+    workflows: ["Build"]
+    types: [completed]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+env:
+  IMAGE_NAME: github-cli
+  OWNER: garbee
+
+jobs:
+  publish:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    environment: Development
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx (for imagetools)
+        uses: docker/setup-buildx-action@v3
+
+      - name: Download artifacts from Build run
+        uses: actions/download-artifact@v4
+        with:
+          path: builds
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: List downloaded artifacts
+        run: |
+          find builds -type f -maxdepth 4 -print
+
+      - name: Load per-arch images
+        id: load
+        run: |
+          set -euo pipefail
+          base="ghcr.io/${OWNER}/${IMAGE_NAME}"
+          images=()
+          version=""
+          while IFS= read -r tarfile; do
+            echo "Loading $tarfile" >&2
+            docker load -i "$tarfile" | tee load.out
+            # Extract loaded image name (e.g., Loaded image: gh-cli-temp:amd64)
+            img=$(awk '/Loaded image:/ {print $3}' load.out | tail -1)
+            arch=$(basename "$tarfile" | sed -E 's/.*-([a-z0-9_]+)\.tar$/\1/')
+            if [ -f "$(dirname "$tarfile")/image-$arch.txt" ]; then
+              v=$(grep '^version=' "$(dirname "$tarfile")/image-$arch.txt" | cut -d= -f2)
+              version="$v"
+            fi
+            new_tag="${base}:build-${{ github.event.workflow_run.id }}-$arch"
+            docker tag "$img" "$new_tag"
+            images+=("$new_tag")
+          done < <(find builds -type f -name 'gh-cli-*.tar' | sort)
+          if [ -z "$version" ]; then
+            echo "Could not determine version" >&2; exit 1;
+          fi
+          printf '%s\n' "${images[@]}" > image-list.txt
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Loaded images:"; cat image-list.txt
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ env.OWNER }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push per-arch images
+        run: |
+          set -euo pipefail
+          while IFS= read -r img; do
+            echo "Pushing $img"; docker push "$img"; done < image-list.txt
+
+      - name: Create and push manifest tags
+        id: manifest
+        run: |
+          set -euo pipefail
+          version='${{ steps.load.outputs.version }}'
+          major=$(echo "$version" | cut -d. -f1)
+          minor=$(echo "$version" | cut -d. -f1-2)
+          base="ghcr.io/${OWNER}/${IMAGE_NAME}"
+          tags=("$base:$version" "$base:$minor" "$base:$major" "$base:latest")
+          echo 'Assembling manifest from:'
+          cat image-list.txt
+          create_args=()
+          for t in "${tags[@]}"; do
+            create_args+=( -t "$t" )
+          done
+          mapfile -t imgs < image-list.txt
+          docker buildx imagetools create "${create_args[@]}" "${imgs[@]}"
+          printf 'Published tags:\n'; printf ' - %s\n' "${tags[@]}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.5.0
+
+      - name: Sign images with Cosign (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          set -euo pipefail
+          version='${{ steps.manifest.outputs.version }}'
+          base="ghcr.io/${OWNER}/${IMAGE_NAME}"
+          major=$(echo "$version" | cut -d. -f1)
+          minor=$(echo "$version" | cut -d. -f1-2)
+          tags=("$base:$version" "$base:$minor" "$base:$major" "$base:latest")
+          echo 'Signing tags:'
+          for t in "${tags[@]}"; do
+            echo "  -> $t";
+            cosign sign --yes "$t";
+          done
+
+      - name: Extract digest for provenance (version tag)
+        id: digest
+        run: |
+          set -euo pipefail
+          version='${{ steps.manifest.outputs.version }}'
+          ref="ghcr.io/${OWNER}/${IMAGE_NAME}:$version"
+          echo "Retrieving manifest digest for $ref" >&2
+          attempt=0
+          digest=""
+          while [ $attempt -lt 5 ]; do
+            if output=$(docker buildx imagetools inspect "$ref" 2>&1); then
+              echo "$output" | sed -n '1,120p'
+              digest=$(echo "$output" | awk '/^Digest:/ {print $2; exit}')
+              if [ -n "$digest" ]; then
+                break
+              fi
+            else
+              echo "imagetools inspect failed (attempt $((attempt+1)))" >&2
+              echo "$output" >&2 || true
+            fi
+            attempt=$((attempt+1))
+            echo "Retrying in 3s..." >&2
+            sleep 3
+          done
+          if [ -z "$digest" ]; then
+            echo "ERROR: Could not extract digest for $ref after $attempt attempts" >&2
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Digest: $digest"
+
+      - name: Generate and push build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ghcr.io/${{ env.OWNER }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify signature (latest tag)
+        run: |
+          set -euo pipefail
+          ID_RE="https://github.com/${{ github.repository }}/.github/workflows/.*@.*"
+          ISSUER="https://token.actions.githubusercontent.com"
+          IMAGE="ghcr.io/${OWNER}/${IMAGE_NAME}:latest"
+          echo "Verifying $IMAGE with identity-regexp $ID_RE"
+          cosign verify \
+            --certificate-identity-regexp "$ID_RE" \
+            --certificate-oidc-issuer "$ISSUER" \
+            "$IMAGE" || { echo 'Verification failed'; exit 1; }
+
+      - name: Inspect final manifest
+        run: |
+          docker buildx imagetools inspect ghcr.io/${OWNER}/${IMAGE_NAME}:latest
