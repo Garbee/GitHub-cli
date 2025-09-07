@@ -62,9 +62,11 @@ jobs:
             echo '::endgroup::'
 
             # Build rich markdown summary
+            build_run_url="https://github.com/$GH_REPO/actions/runs/$RUN_ID"
             {
               echo "## 🚫 Publish Blocked: Missing Build Artifacts";
               echo "**Run ID:** $RUN_ID";
+              echo "**Build Run:** [$build_run_url]($build_run_url)";
               echo "**Repository:** $GH_REPO";
               echo "**Found Count:** $count";
               echo "**Required Artifacts:** ${required[*]}";
@@ -90,6 +92,13 @@ jobs:
           fi
 
           echo "All required artifacts present: ${required[*]}"
+          build_run_url="https://github.com/$GH_REPO/actions/runs/$RUN_ID"
+          {
+            echo "## ✅ Build Artifacts Verified";
+            echo "**Run ID:** $RUN_ID";
+            echo "**Build Run:** [$build_run_url]($build_run_url)";
+            echo "**Artifacts Present:** ${required[*]}";
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Buildx (for imagetools)
         uses: docker/setup-buildx-action@v3
