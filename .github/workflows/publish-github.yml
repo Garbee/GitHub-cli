@@ -7,7 +7,7 @@ on:
 
 permissions:
   contents: read
-  actions: read       # needed to download artifacts from another run
+  #actions: read       # needed to download artifacts from another run
   packages: write
   id-token: write
   attestations: write
