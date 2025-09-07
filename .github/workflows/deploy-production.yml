@@ -95,13 +95,19 @@ jobs:
           for t in "${tags[@]}"; do
             create_args+=( -t "$t" )
           done
+          # Pull labels from source (multi-arch manifest uses one platform ref here)
+          title=$(docker buildx imagetools inspect "$src_version" | awk -F': ' '/org.opencontainers.image.title/ {print $2; exit}')
           desc='${{ steps.meta.outputs.desc }}'
-          if [ -n "$desc" ]; then
-            echo "Annotating manifest with description: $desc" >&2
-            docker buildx imagetools create "${create_args[@]}" --annotation "org.opencontainers.image.description=$desc" "$src_version"
-          else
-            docker buildx imagetools create "${create_args[@]}" "$src_version"
-          fi
+          source=$(docker image inspect "ghcr.io/${OWNER}/${IMAGE_NAME}:latest" -f '{{ index .Config.Labels "org.opencontainers.image.source"}}' 2>/dev/null || true)
+          licenses=$(docker image inspect "ghcr.io/${OWNER}/${IMAGE_NAME}:latest" -f '{{ index .Config.Labels "org.opencontainers.image.licenses"}}' 2>/dev/null || true)
+          ann_args=()
+          add_ann() { [ -n "$2" ] && ann_args+=( --annotation "$1=$2" ); }
+          add_ann org.opencontainers.image.title "$title"
+          add_ann org.opencontainers.image.description "$desc"
+          add_ann org.opencontainers.image.source "$source"
+          add_ann org.opencontainers.image.version "$version"
+          add_ann org.opencontainers.image.licenses "$licenses"
+          docker buildx imagetools create "${create_args[@]}" "${ann_args[@]}" "$src_version"
           printf '%s\n' "${tags[@]}" > dockerhub-tags.txt
 
       - name: Show pushed Docker Hub manifest

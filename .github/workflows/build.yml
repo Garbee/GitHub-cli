@@ -48,15 +48,47 @@ jobs:
           echo "Building gh-cli $version for $platform (arch=$arch)"
           out_dir="out-$arch"
           mkdir -p "$out_dir"
+          # Extract label values from Dockerfile (fallback to empty if not matched)
+          get_label() { grep -E "org.opencontainers.image.$1=" -m1 Dockerfile | sed -E 's/.*org.opencontainers.image.$1="([^"]*)".*/\1/' || true; }
+          title=$(get_label title)
+          desc=$(get_label description)
+          source=$(get_label source)
+          licenses=$(get_label licenses)
+          # We already have version variable
+          echo "Label summary:"; printf ' - %s=%s\n' title "$title" description "$desc" source "$source" version "$version" licenses "$licenses"
           # Produce a docker archive tar containing the single-arch image.
           docker buildx build \
             --platform "$platform" \
             --build-arg GH_VERSION="$version" \
+            --label org.opencontainers.image.title="$title" \
+            --label org.opencontainers.image.description="$desc" \
+            --label org.opencontainers.image.source="$source" \
+            --label org.opencontainers.image.version="$version" \
+            --label org.opencontainers.image.licenses="$licenses" \
             -t gh-cli-temp:$arch \
             --output type=docker,dest="$out_dir/gh-cli-${arch}.tar" .
           printf 'arch=%s\nversion=%s\n' "$arch" "$version" > "$out_dir/image-${arch}.txt"
           echo "arch=$arch" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify OCI labels present
+        run: |
+          set -euo pipefail
+          arch='${{ steps.build.outputs.arch }}'
+          # Load temp to inspect (ephemeral)
+          tar="out-${{ steps.build.outputs.arch }}/gh-cli-${{ steps.build.outputs.arch }}.tar"
+          docker load -i "$tar" >/dev/null
+          img="gh-cli-temp:${{ steps.build.outputs.arch }}"
+          for key in org.opencontainers.image.title org.opencontainers.image.description org.opencontainers.image.source org.opencontainers.image.version org.opencontainers.image.licenses; do
+            val=$(docker image inspect "$img" -f "{{ index .Config.Labels \"$key\" }}") || true
+            if [ -z "$val" ]; then
+              echo "::error title=Missing OCI Label::$key not found on $img"
+              missing=1
+            else
+              echo "$key=$val"
+            fi
+          done
+          [ -n "${missing:-}" ] && { echo 'One or more required OCI labels missing.'; exit 1; }
 
       - name: Upload build artifact (image + metadata)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
