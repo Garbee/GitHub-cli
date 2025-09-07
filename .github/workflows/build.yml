@@ -49,6 +49,7 @@ jobs:
           out_dir="out-$arch"
           mkdir -p "$out_dir"
           # Extract label values from Dockerfile (fallback to empty if not matched)
+          get_label() { grep -E "org.opencontainers.image.$1=" -m1 Dockerfile | sed -E 's/.*org.opencontainers.image.$1="([^"]*)".*/\1/' || true; }
           desc=$(get_label description)
           # We already have version variable
           echo "Label summary:"; printf ' - %s=%s\n' title "$title" description "$desc" source "$source" version "$version" licenses "$licenses"
