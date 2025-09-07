@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  # actions: read       # needed to download artifacts from another run
   packages: write
   id-token: write
   attestations: write
@@ -23,6 +24,72 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Debug list build artifacts (pre-download)
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          GH_REPO: ${{ github.repository }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo '::group::Fetch artifact metadata'
+          echo "Listing artifacts for run $RUN_ID in $GH_REPO" >&2
+          curl -sSL -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/$GH_REPO/actions/runs/$RUN_ID/artifacts" | tee artifacts.json
+          echo 'Raw artifact JSON saved to artifacts.json'
+          echo '::endgroup::'
+
+          echo '::group::Artifact names'
+          jq -r '.artifacts[]?.name' artifacts.json || true
+          echo '::endgroup::'
+
+          count=$(jq '.artifacts|length' artifacts.json || echo 0)
+          # Expected artifacts (keep in sync with build matrix)
+          required=(build-amd64 build-arm64)
+          missing=()
+          for r in "${required[@]}"; do
+            if ! jq -e --arg n "$r" '.artifacts[]?.name == $n' artifacts.json >/dev/null 2>&1; then
+              missing+=("$r")
+            fi
+          done
+
+          if [ "$count" -eq 0 ] || [ ${#missing[@]} -gt 0 ]; then
+            echo '::group::Diagnostics'
+            echo "Artifact count: $count" >&2
+            echo "Required: ${required[*]}" >&2
+            echo "Missing: ${missing[*]:-<none>}" >&2
+            echo 'Recent Build run logs may show upload-artifact failures or retention expiration.' >&2
+            echo '::endgroup::'
+
+            # Build rich markdown summary
+            {
+              echo "## 🚫 Publish Blocked: Missing Build Artifacts";
+              echo "**Run ID:** $RUN_ID";
+              echo "**Repository:** $GH_REPO";
+              echo "**Found Count:** $count";
+              echo "**Required Artifacts:** ${required[*]}";
+              if [ ${#missing[@]} -gt 0 ]; then
+                echo "**Missing:** ${missing[*]}";
+              fi
+              echo "### Suggested Actions";
+              echo "1. Open the Build workflow for run $RUN_ID and confirm all matrix jobs succeeded.";
+              echo "2. Check each job's 'Upload build artifact' step for errors or size limits.";
+              echo "3. Ensure the workflow name is exactly 'Build' (case-sensitive) so workflow_run triggers.";
+              echo "4. Verify artifacts not expired (retention 2 days) and not manually deleted.";
+              echo "5. Re-run the failed Build job if necessary, then re-trigger Publish.";
+              echo "### Raw Artifact Names";
+              jq -r '.artifacts[]?.name' artifacts.json | sed 's/^/- /' || echo '- <none>';
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            if [ "$count" -eq 0 ]; then
+              echo "::error title=No Artifacts Found::Build run $RUN_ID produced zero artifacts. Publishing cannot continue." >&2
+            else
+              echo "::error title=Missing Required Artifacts::Missing: ${missing[*]} (run $RUN_ID)." >&2
+            fi
+            exit 1
+          fi
+
+          echo "All required artifacts present: ${required[*]}"
 
       - name: Set up Buildx (for imagetools)
         uses: docker/setup-buildx-action@v3
