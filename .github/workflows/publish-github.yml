@@ -4,6 +4,7 @@ on:
   workflow_run:
     workflows: ["Build"]
     types: [completed]
+    branches: [ main ]
 
 permissions:
   contents: read
@@ -147,6 +148,15 @@ jobs:
           minor=$(echo "$version" | cut -d. -f1-2)
           base="ghcr.io/${OWNER}/${IMAGE_NAME}"
           tags=("$base:$version" "$base:$minor" "$base:$major" "$base:latest")
+
+          # Extract description label from Dockerfile for index annotation (multi-arch manifest level)
+          desc=$(grep -E 'org.opencontainers.image.description=' -m1 Dockerfile | sed -E 's/.*org.opencontainers.image.description="([^"]*)".*/\1/' || true)
+          if [ -z "${desc}" ]; then
+            echo '::warning title=Missing Description Label::Could not extract org.opencontainers.image.description from Dockerfile; proceeding without manifest annotation.'
+            echo '⚠️ No description annotation applied (label not found in Dockerfile).' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Using description for annotation: $desc" >&2
+          fi
           echo 'Assembling manifest from:'
           cat image-list.txt
           create_args=()
@@ -154,7 +164,11 @@ jobs:
             create_args+=( -t "$t" )
           done
           mapfile -t imgs < image-list.txt
-          docker buildx imagetools create "${create_args[@]}" "${imgs[@]}"
+          if [ -n "${desc}" ]; then
+            docker buildx imagetools create "${create_args[@]}" --annotation "org.opencontainers.image.description=${desc}" "${imgs[@]}"
+          else
+            docker buildx imagetools create "${create_args[@]}" "${imgs[@]}"
+          fi
           printf 'Published tags:\n'; printf ' - %s\n' "${tags[@]}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
