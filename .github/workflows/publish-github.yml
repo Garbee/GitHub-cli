@@ -34,8 +34,30 @@ jobs:
           set -euo pipefail
           echo '::group::Fetch artifact metadata'
           echo "Listing artifacts for run $RUN_ID in $GH_REPO" >&2
-          curl -sSL -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.github+json' \
-            "https://api.github.com/repos/$GH_REPO/actions/runs/$RUN_ID/artifacts" | tee artifacts.json
+          API_URL="https://api.github.com/repos/$GH_REPO/actions/runs/$RUN_ID/artifacts"
+          http_code=$(curl -sS -o artifacts.json -w '%{http_code}' \
+            -H "Authorization: Bearer $TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "$API_URL" || echo 000)
+          echo "HTTP status: $http_code" >&2
+          if [ "$http_code" -ne 200 ]; then
+            echo '::endgroup::'
+            echo '::error title=Artifact API Request Failed::Unable to list artifacts.'
+            if command -v jq >/dev/null 2>&1; then
+              msg=$(jq -r '.message // empty' artifacts.json 2>/dev/null || true)
+              if [ -n "$msg" ]; then
+                echo "API message: $msg" >&2
+              fi
+            fi
+            echo "Raw response (truncated):" >&2
+            head -c 500 artifacts.json >&2 || true
+            echo '' >&2
+            echo "Possible causes:" >&2
+            echo " - Insufficient permissions (need actions: read)." >&2
+            echo " - Run ID $RUN_ID does not belong to this repository." >&2
+            echo " - Run not finished or was deleted." >&2
+            exit 1
+          fi
           echo 'Raw artifact JSON saved to artifacts.json'
           echo '::endgroup::'
 
@@ -43,7 +65,13 @@ jobs:
           jq -r '.artifacts[]?.name' artifacts.json || true
           echo '::endgroup::'
 
-          count=$(jq '.artifacts|length' artifacts.json || echo 0)
+          # Validate JSON has artifacts array; if missing treat as zero.
+          if ! jq -e '.artifacts' artifacts.json >/dev/null 2>&1; then
+            echo '::warning::Response JSON missing artifacts array; treating as zero results.'
+            count=0
+          else
+            count=$(jq '.artifacts|length' artifacts.json || echo 0)
+          fi
           # Expected artifacts (keep in sync with build matrix)
           required=(build-amd64 build-arm64)
           missing=()
@@ -65,26 +93,15 @@ jobs:
               url=$(jq -r --arg n "$aname" '.artifacts[] | select(.name==$n) | .archive_download_url' artifacts.json 2>/dev/null || true)
               if [ -n "$aid" ] && [ -n "$url" ] && [ "$url" != "null" ]; then
                 # HEAD request (follow redirects) to test accessibility
-                code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.github+json' -L -I "$url" || echo 000)
-                case "$code" in
-                  200|302|301)
-                    present_access_ok+=("$aname:$code")
-                    ;;
-                  *)
-                    present_access_fail+=("$aname:$code")
-                    ;;
-                esac
-                # Direct API GET check (closest to actions/download-artifact behavior)
-                # Endpoint: GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/zip
-                api_download_code=$(curl -s -o /dev/null -w '%{http_code}' \
-                  -H "Authorization: Bearer $TOKEN" \
-                  -H 'Accept: application/vnd.github+json' \
-                  "https://api.github.com/repos/$GH_REPO/actions/artifacts/$aid/zip" || echo 000)
-                if [ "$api_download_code" -ne 200 ]; then
-                  # Replace or append a failure marker reflecting API code (preferred signal)
-                  present_access_fail+=("$aname:api-$api_download_code")
+                head_code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.github+json' -L -I "$url" || echo 000)
+                # Artifact ZIP API (may 302 redirect to storage) – treat 200 or 302/301 as success
+                zip_url="https://api.github.com/repos/$GH_REPO/actions/artifacts/$aid/zip"
+                zip_code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.github+json' "$zip_url" || echo 000)
+                success_codes="200 301 302"
+                if echo " $success_codes " | grep -q " $head_code " && echo " $success_codes " | grep -q " $zip_code "; then
+                  present_access_ok+=("$aname:head-$head_code+zip-$zip_code")
                 else
-                  present_access_ok+=("$aname:api-200")
+                  present_access_fail+=("$aname:head-$head_code+zip-$zip_code")
                 fi
               fi
             done <<< "$names"
@@ -163,7 +180,7 @@ jobs:
           find builds -type f -maxdepth 4 -print
 
       - name: Load per-arch images
-        id: load
+            {
         run: |
           set -euo pipefail
           base="ghcr.io/${OWNER}/${IMAGE_NAME}"
@@ -207,7 +224,12 @@ jobs:
         id: manifest
         run: |
           set -euo pipefail
-          version='${{ steps.load.outputs.version }}'
+          # Obtain version by scanning metadata file (more reliable across context limitations)
+          meta_file=$(find builds -type f -name 'image-*.txt' | head -1 || true)
+          if [ -n "$meta_file" ]; then
+            version=$(grep '^version=' "$meta_file" | cut -d= -f2 || true)
+          fi
+          [ -z "${version:-}" ] && { echo 'Could not resolve version in manifest step'; exit 1; }
           major=$(echo "$version" | cut -d. -f1)
           minor=$(echo "$version" | cut -d. -f1-2)
           base="ghcr.io/${OWNER}/${IMAGE_NAME}"
