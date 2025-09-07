@@ -15,6 +15,9 @@ permissions:
 env:
   IMAGE_NAME: github-cli
   OWNER: garbee
+  BUILD_RUN_ID: ${{ github.event.workflow_run.id }}
+  BUILD_RUN_URL: ${{ format('https://github.com/{0}/actions/runs/{1}', github.repository, github.event.workflow_run.id) }}
+  REPO: ${{ github.repository }}
 
 jobs:
   publish:
@@ -23,164 +26,72 @@ jobs:
     environment: Development
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-      - name: Debug list build artifacts (pre-download)
-        env:
-          RUN_ID: ${{ github.event.workflow_run.id }}
-          GH_REPO: ${{ github.repository }}
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download (build-amd64)
+        id: dl_amd64
+        continue-on-error: true
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: build-amd64
+          run-id: ${{ env.BUILD_RUN_ID }}
+          path: builds/build-amd64
+
+      - name: Download (build-arm64)
+        id: dl_arm64
+        continue-on-error: true
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # 5.0.0
+        with:
+          name: build-arm64
+          run-id: ${{ env.BUILD_RUN_ID }}
+          path: builds/build-arm64
+
+      - name: Validate artifact download
+        id: eval_downloads
         run: |
           set -euo pipefail
-          echo '::group::Fetch artifact metadata'
-          echo "Listing artifacts for run $RUN_ID in $GH_REPO" >&2
-          API_URL="https://api.github.com/repos/$GH_REPO/actions/runs/$RUN_ID/artifacts"
-          http_code=$(curl -sS -o artifacts.json -w '%{http_code}' \
-            -H "Authorization: Bearer $TOKEN" \
-            -H 'Accept: application/vnd.github+json' \
-            "$API_URL" || echo 000)
-          echo "HTTP status: $http_code" >&2
-          if [ "$http_code" -ne 200 ]; then
-            echo '::endgroup::'
-            echo '::error title=Artifact API Request Failed::Unable to list artifacts.'
-            if command -v jq >/dev/null 2>&1; then
-              msg=$(jq -r '.message // empty' artifacts.json 2>/dev/null || true)
-              if [ -n "$msg" ]; then
-                echo "API message: $msg" >&2
-              fi
-            fi
-            echo "Raw response (truncated):" >&2
-            head -c 500 artifacts.json >&2 || true
-            echo '' >&2
-            echo "Possible causes:" >&2
-            echo " - Insufficient permissions (need actions: read)." >&2
-            echo " - Run ID $RUN_ID does not belong to this repository." >&2
-            echo " - Run not finished or was deleted." >&2
-            exit 1
-          fi
-          echo 'Raw artifact JSON saved to artifacts.json'
-          echo '::endgroup::'
-
-          echo '::group::Artifact names'
-          jq -r '.artifacts[]?.name' artifacts.json || true
-          echo '::endgroup::'
-
-          # Validate JSON has artifacts array; if missing treat as zero.
-          if ! jq -e '.artifacts' artifacts.json >/dev/null 2>&1; then
-            echo '::warning::Response JSON missing artifacts array; treating as zero results.'
-            count=0
-          else
-            count=$(jq '.artifacts|length' artifacts.json || echo 0)
-          fi
-          # Expected artifacts (keep in sync with build matrix)
-          required=(build-amd64 build-arm64)
-          missing=()
-          names=$(jq -r '.artifacts[]?.name' artifacts.json || true)
-          for r in "${required[@]}"; do
-            if ! grep -Fxq "$r" <<< "$names"; then
-              missing+=("$r")
-            fi
-          done
-
-          # Attempt to verify download accessibility for each artifact (even if permission is missing) to surface permission errors early.
-          # We only attempt for artifacts that are present (not missing) and whose names start with build-
-          present_access_fail=()
-          present_access_ok=()
-          if command -v jq >/dev/null 2>&1; then
-            while read -r aname; do
-              [ -z "$aname" ] && continue
-              aid=$(jq -r --arg n "$aname" '.artifacts[] | select(.name==$n) | .id' artifacts.json 2>/dev/null || true)
-              url=$(jq -r --arg n "$aname" '.artifacts[] | select(.name==$n) | .archive_download_url' artifacts.json 2>/dev/null || true)
-              if [ -n "$aid" ] && [ -n "$url" ] && [ "$url" != "null" ]; then
-                # HEAD request (follow redirects) to test accessibility
-                head_code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.github+json' -L -I "$url" || echo 000)
-                # Artifact ZIP API (may 302 redirect to storage) – treat 200 or 302/301 as success
-                zip_url="https://api.github.com/repos/$GH_REPO/actions/artifacts/$aid/zip"
-                zip_code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.github+json' "$zip_url" || echo 000)
-                success_codes="200 301 302"
-                if echo " $success_codes " | grep -q " $head_code " && echo " $success_codes " | grep -q " $zip_code "; then
-                  present_access_ok+=("$aname:head-$head_code+zip-$zip_code")
-                else
-                  present_access_fail+=("$aname:head-$head_code+zip-$zip_code")
-                fi
-              fi
-            done <<< "$names"
-          fi
-
-          # If any required missing OR any present artifact failed accessibility, block.
-          if [ "$count" -eq 0 ] || [ ${#missing[@]} -gt 0 ] || [ ${#present_access_fail[@]} -gt 0 ]; then
-            echo '::group::Diagnostics'
-            echo "Artifact count: $count" >&2
-            echo "Required: ${required[*]}" >&2
-            echo "Missing: ${missing[*]:-<none>}" >&2
-            if [ ${#present_access_ok[@]} -gt 0 ]; then echo "Accessible: ${present_access_ok[*]}" >&2; fi
-            if [ ${#present_access_fail[@]} -gt 0 ]; then echo "Inaccessible: ${present_access_fail[*]}" >&2; fi
-            echo 'Recent Build run logs may show upload-artifact failures or retention expiration.' >&2
-            echo '::endgroup::'
-
-            # Build rich markdown summary
-            build_run_url="https://github.com/$GH_REPO/actions/runs/$RUN_ID"
+          a_out='${{ steps.dl_amd64.outcome }}'
+          b_out='${{ steps.dl_arm64.outcome }}'
+          echo "Validation outcomes: amd64=$a_out arm64=$b_out"
+          summary_failed=false
+          if [ "$a_out" != "success" ] || [ "$b_out" != "success" ]; then
+            summary_failed=true
             {
-              echo "## 🚫 Publish Blocked: Missing Build Artifacts";
-              echo "**Run ID:** $RUN_ID";
-              echo "**Build Run:** [$build_run_url]($build_run_url)";
-              echo "**Repository:** $GH_REPO";
-              echo "**Found Count:** $count";
-              echo "**Required Artifacts:** ${required[*]}";
-              if [ ${#missing[@]} -gt 0 ]; then
-                echo "**Missing:** ${missing[*]}";
-              fi
-              if [ ${#present_access_fail[@]} -gt 0 ]; then
-                echo "**Inaccessible Artifacts (HTTP codes):** ${present_access_fail[*]}";
-              fi
-              if [ ${#present_access_ok[@]} -gt 0 ]; then
-                echo "**Accessible Artifacts:** ${present_access_ok[*]}";
-              fi
-              echo "### Suggested Actions";
-              echo "1. Open the Build workflow for run $RUN_ID and confirm all matrix jobs succeeded.";
-              echo "2. Check each job's 'Upload build artifact' step for errors or size limits.";
-              echo "3. Ensure the workflow name is exactly 'Build' (case-sensitive) so workflow_run triggers.";
-              echo "4. If artifacts show as inaccessible (403/404), check for 'actions: read' permission in this workflow.";
-              echo "5. Verify artifacts not expired (retention 2 days) and not manually deleted.";
-              echo "6. Re-run the failed Build job if necessary, then re-trigger Publish.";
-              echo "### Raw Artifact Names";
-              jq -r '.artifacts[]?.name' artifacts.json | sed 's/^/- /' || echo '- <none>';
+              echo "## ❌ Artifact Download Validation Failed";
+              echo "One or more required artifacts could not be downloaded using the official actions/download-artifact action.";
+              echo "**amd64 outcome:** $a_out";
+              echo "**arm64 outcome:** $b_out";
+              echo "### Likely Causes";
+              echo "1. 'actions: read' permission not granted in this publish workflow (currently commented).";
+              echo "2. Artifact retention expired or artifact manually deleted.";
+              echo "3. Name mismatch (expected: build-amd64, build-arm64).";
+              echo "4. Source run belongs to a fork (GITHUB_TOKEN scope differences).";
+              echo "### Next Steps";
+              echo "- Verify 'actions: read' under permissions and re-run.";
+              echo "- Verify artifact names in the Build workflow output.";
+              echo "- Confirm artifacts still visible via the UI for run [$BUILD_RUN_ID]($BUILD_RUN_URL).";
             } >> "$GITHUB_STEP_SUMMARY"
-
-            if [ "$count" -eq 0 ]; then
-              echo "::error title=No Artifacts Found::Build run $RUN_ID produced zero artifacts. Publishing cannot continue." >&2
-            elif [ ${#missing[@]} -gt 0 ]; then
-              echo "::error title=Missing Required Artifacts::Missing: ${missing[*]} (run $RUN_ID)." >&2
-            elif [ ${#present_access_fail[@]} -gt 0 ]; then
-              echo "::error title=Artifact Access Failure::Inaccessible: ${present_access_fail[*]} (run $RUN_ID)." >&2
-            fi
-            exit 1
+            echo "::error title=Artifact Download Validation Failed::Unable to download one or more required artifacts (amd64=$a_out arm64=$b_out)." >&2
           fi
-
-          echo "All required artifacts present: ${required[*]}"
-          build_run_url="https://github.com/$GH_REPO/actions/runs/$RUN_ID"
-          {
-            echo "## ✅ Build Artifacts Verified";
-            echo "**Run ID:** $RUN_ID";
-            echo "**Build Run:** [$build_run_url]($build_run_url)";
-            echo "**Artifacts Present:** ${required[*]}";
-          } >> "$GITHUB_STEP_SUMMARY"
+          $summary_failed && exit 1 || echo 'Artifact downloads validated.'
 
       - name: Set up Buildx (for imagetools)
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
-      - name: Download artifacts from Build run
-        uses: actions/download-artifact@v4
-        with:
-          path: builds
-          run-id: ${{ github.event.workflow_run.id }}
-
-      - name: List downloaded artifacts
+      - name: Prepare artifacts for publish (reuse emulation downloads)
         run: |
-          find builds -type f -maxdepth 4 -print
+          set -euo pipefail
+          mkdir -p builds
+          # Copy files from each emulated download into unified builds dir
+          for d in builds/build-*; do
+            [ -d "$d" ] || continue
+            echo "Staging artifacts from $d" >&2
+            cp -a "$d"/. builds/
+          done
+          echo "Final staged artifact file list:" >&2
+          find builds -type f -maxdepth 2 -print | sed 's/^/ - /'
 
       - name: Load per-arch images
-            {
         run: |
           set -euo pipefail
           base="ghcr.io/${OWNER}/${IMAGE_NAME}"
@@ -196,7 +107,7 @@ jobs:
               v=$(grep '^version=' "$(dirname "$tarfile")/image-$arch.txt" | cut -d= -f2)
               version="$v"
             fi
-            new_tag="${base}:build-${{ github.event.workflow_run.id }}-$arch"
+            new_tag="${base}:build-${BUILD_RUN_ID}-$arch"
             docker tag "$img" "$new_tag"
             images+=("$new_tag")
           done < <(find builds -type f -name 'gh-cli-*.tar' | sort)
@@ -208,7 +119,7 @@ jobs:
           echo "Loaded images:"; cat image-list.txt
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
         with:
           registry: ghcr.io
           username: ${{ env.OWNER }}
@@ -246,7 +157,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install Cosign
-        uses: sigstore/cosign-installer@v3.5.0
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
 
       - name: Sign images with Cosign (keyless)
         env:
@@ -296,7 +207,7 @@ jobs:
           echo "Digest: $digest"
 
       - name: Generate and push build provenance
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
           subject-name: ghcr.io/${{ env.OWNER }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.digest.outputs.digest }}
