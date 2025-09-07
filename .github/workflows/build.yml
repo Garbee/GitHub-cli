@@ -51,9 +51,10 @@ jobs:
           # Extract label values from Dockerfile (fallback to empty if not matched)
           get_label() { grep -E "org.opencontainers.image.$1=" -m1 Dockerfile | sed -E 's/.*org.opencontainers.image.$1="([^"]*)".*/\1/' || true; }
           desc=$(get_label description)
-          # We already have version variable
-          echo "Label summary:"; printf ' - %s=%s\n' title "$title" description "$desc" source "$source" version "$version" licenses "$licenses"
-          # Produce a docker archive tar containing the single-arch image.
+          echo '::group::Labels summary:'
+          printf ' - %s=%s\n' version "$version" description "$desc"
+          echo '::endgroup::'
+
           docker buildx build \
             --platform "$platform" \
             --build-arg GH_VERSION="$version" \
